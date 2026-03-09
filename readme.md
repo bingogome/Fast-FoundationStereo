@@ -38,6 +38,7 @@ bash docker/run_container.sh
 conda create -n ffs python=3.12 && conda activate ffs
 pip install torch==2.6.0 torchvision==0.21.0 xformers --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
+pip install pyrealsense2  # optional, needed for live RealSense streaming
 ```
 
 
@@ -98,6 +99,31 @@ Expect to see results like below:
   <p align="center">
     <img src="assets/pcl_vis.png" alt="Point Cloud Visualization" width="100%">
   </p>
+
+
+# RealSense Realtime Point Cloud
+Use this for live RealSense D4xx IR stereo streaming to disparity/depth/point cloud.
+
+```
+python scripts/run_realsense_realtime.py \
+  --model_dir weights/23-36-37/model_best_bp2_serialize.pth \
+  --width 640 --height 480 --fps 30 \
+  --rectify 1 --equalize_hist 1 \
+  --scale 1.0 --valid_iters 8 --max_disp 192 \
+  --znear 0.1 --zfar 10.0 --pc_stride 2 \
+  --show_disp 1 --show_pc 1 \
+  --save_intrinsic_file output/realsense/K_runtime.txt \
+  --out_dir output/realsense
+```
+
+Notes:
+- This script uses IR left/right streams (`infrared 1/2`) from RealSense.
+- `--rectify 1` is recommended unless your input pair is already rectified.
+- The runtime intrinsic file follows the same format as `K.txt` in this repo:
+  - Line 1: flattened `3x3` intrinsic matrix
+  - Line 2: stereo baseline in meters
+- For higher FPS, reduce `--valid_iters`, reduce `--scale`, or increase `--pc_stride`.
+- Press `q` or `ESC` in the disparity window to quit.
 
 
 # ONNX/TRT
