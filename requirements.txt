@@ -17,3 +17,8 @@ open3d
 # tensorrt-lean-cu12
 # tensorrt-dispatch-cu12
 # nvidia-modelopt[torch]
+
+# === Thor ===
+# uv pip install torch==2.9.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu130
+# conda install -c conda-forge open3d
+# conda install -c conda-forge pyrealsense2

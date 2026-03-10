@@ -3,6 +3,8 @@
 
 import argparse
 import csv
+import ctypes
+import glob
 import logging
 import os
 import sys
@@ -13,8 +15,57 @@ from datetime import datetime
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-import torch
 import yaml
+from PIL import Image
+
+
+def _prepend_env_path(var_name, path):
+    if not os.path.isdir(path):
+        return
+    cur = os.environ.get(var_name, "")
+    parts = [p for p in cur.split(":") if p]
+    if path in parts:
+        return
+    os.environ[var_name] = f"{path}:{cur}" if cur else path
+
+
+def _bootstrap_torch_cuda_runtime():
+    """Make Torch find NVPL/CUDSS runtime libs even if conda hooks were not sourced."""
+    prefix = os.environ.get("CONDA_PREFIX", sys.prefix)
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = os.path.join(prefix, "lib", pyver, "site-packages")
+    nvpl_dir = os.path.join(site_packages, "nvpl", "lib")
+    cu13_dir = os.path.join(site_packages, "nvidia", "cu13", "lib")
+
+    _prepend_env_path("LD_LIBRARY_PATH", nvpl_dir)
+    _prepend_env_path("LD_LIBRARY_PATH", cu13_dir)
+
+    # Preload key shared objects by absolute path so torch import succeeds
+    # even when LD_LIBRARY_PATH wasn't active at process start.
+    preload = [
+        os.path.join(nvpl_dir, "libnvpl_blas_lp64_gomp.so.0"),
+        os.path.join(nvpl_dir, "libnvpl_lapack_lp64_gomp.so.0"),
+        os.path.join(cu13_dir, "libcudss.so.0"),
+    ]
+    for so_path in preload:
+        if os.path.isfile(so_path):
+            ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+
+    # Also preload any additional CUDSS/NVPL layer libs if present.
+    for pattern in (
+        os.path.join(nvpl_dir, "libnvpl_*.so*"),
+        os.path.join(cu13_dir, "libcudss*.so*"),
+    ):
+        for so_path in sorted(glob.glob(pattern)):
+            try:
+                ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                # Best-effort preload only.
+                pass
+
+
+_bootstrap_torch_cuda_runtime()
+import torch
 
 CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(CODE_DIR, ".."))
@@ -48,14 +99,14 @@ def parse_args():
     parser.add_argument("--use_color", type=int, default=1)
     parser.add_argument("--emitter", type=int, default=1)
     parser.add_argument("--serial", type=str, default=None)
-    parser.add_argument("--hardware_reset_on_start", type=int, default=1)
+    parser.add_argument("--hardware_reset_on_start", type=int, default=0)
     parser.add_argument("--reset_wait_sec", type=float, default=3.0)
     parser.add_argument("--save_intrinsic_file", type=str, default=None)
     parser.add_argument("--frame_timeout_ms", type=int, default=5000)
-    parser.add_argument("--startup_retries", type=int, default=1)
+    parser.add_argument("--startup_retries", type=int, default=3)
     parser.add_argument("--restart_backoff_sec", type=float, default=0.8)
-    parser.add_argument("--show_disp", type=int, default=1)
-    parser.add_argument("--show_pc", type=int, default=1)
+    parser.add_argument("--show_disp", type=int, default=0)
+    parser.add_argument("--show_pc", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=30)
 
     parser.add_argument(
@@ -176,6 +227,34 @@ def save_runtime_k(path, K, baseline):
         f.write(f"{baseline:.8f}\n")
 
 
+def has_display():
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def frame_to_ndarray(frame):
+    """Convert a pyrealsense2 frame into a concrete contiguous uint8 array."""
+    if frame is None:
+        return None
+    arr = np.asarray(frame.get_data())
+    if isinstance(arr, np.ndarray) and arr.dtype != object and arr.size > 0:
+        return np.ascontiguousarray(arr)
+
+    video = frame.as_video_frame()
+    h, w = video.get_height(), video.get_width()
+    bpp = video.get_bytes_per_pixel()
+    channels = max(1, int(bpp))
+    raw = np.frombuffer(frame.get_data(), dtype=np.uint8)
+    expected = h * w * channels
+    if raw.size < expected:
+        raise RuntimeError(
+            f"Frame buffer too small: got {raw.size} bytes, expected at least {expected}"
+        )
+    raw = raw[:expected]
+    if channels == 1:
+        return raw.reshape(h, w)
+    return raw.reshape(h, w, channels)
+
+
 def stop_pipeline_safely(pipeline):
     if pipeline is None:
         return
@@ -191,7 +270,10 @@ def destroy_o3d_window_safely(vis):
 def cleanup_runtime(state):
     stop_pipeline_safely(state.get("pipeline"))
     destroy_o3d_window_safely(state.get("vis"))
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
     logging.info("Shutdown complete.")
 
 
@@ -373,16 +455,50 @@ def compute_diff_metrics(cur_gray, ref_gray, pixel_diff_thresh):
 
 
 def save_image_or_raise(path, image):
-    if not cv2.imwrite(path, image):
-        raise IOError(f"Failed to save image: {path}")
+    arr = np.ascontiguousarray(np.asarray(image))
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+
+    try:
+        if arr.ndim == 2:
+            Image.fromarray(arr, mode="L").save(path)
+            return
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            # Convert BGR to RGB before saving with Pillow.
+            Image.fromarray(arr[:, :, ::-1], mode="RGB").save(path)
+            return
+    except Exception as exc:
+        raise IOError(f"Failed to save image: {path} ({exc})") from exc
+
+    raise IOError(f"Unsupported image shape for save: {arr.shape}")
+
+
+def save_point_cloud_ascii_ply(path, points, colors):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        rgb = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+        for (x, y, z), (r, g, b) in zip(points, rgb, strict=False):
+            f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
 
 
 def save_point_cloud_or_raise(path, points, colors):
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-    if not o3d.io.write_point_cloud(path, cloud):
-        raise IOError(f"Failed to save point cloud: {path}")
+    if o3d is not None:
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+        cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+        if not o3d.io.write_point_cloud(path, cloud):
+            raise IOError(f"Failed to save point cloud: {path}")
+        return
+    save_point_cloud_ascii_ply(path, points, colors)
 
 
 def save_keyframe(args, key_idx, left_proc, right_proc, color_bgr, depth, points, colors):
@@ -418,10 +534,18 @@ def main():
     torch.autograd.set_grad_enabled(False)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    if o3d is None:
-        raise RuntimeError("open3d is required for point cloud saving.")
     if args.startup_retries < 1:
         raise ValueError("--startup_retries must be >= 1")
+    if not has_display():
+        if args.show_disp:
+            logging.warning("No display detected; disabling --show_disp.")
+            args.show_disp = 0
+        if args.show_pc:
+            logging.warning("No display detected; disabling --show_pc.")
+            args.show_pc = 0
+    if args.show_pc and o3d is None:
+        logging.warning("open3d is not available; disabling --show_pc.")
+        args.show_pc = 0
 
     runtime_state = {"pipeline": None, "vis": None}
     pcd = None
@@ -488,13 +612,17 @@ def main():
             logging.info("Model warmup done")
 
             if args.show_pc:
-                vis = o3d.visualization.Visualizer()
-                vis.create_window("FFS Keyframe Capture Point Cloud", width=1280, height=720)
-                vis.get_render_option().point_size = 2.0
-                vis.get_render_option().background_color = np.array([0.1, 0.1, 0.1])
-                pcd = o3d.geometry.PointCloud()
-                vis.add_geometry(pcd)
-                runtime_state["vis"] = vis
+                try:
+                    vis = o3d.visualization.Visualizer()
+                    vis.create_window("FFS Keyframe Capture Point Cloud", width=1280, height=720)
+                    vis.get_render_option().point_size = 2.0
+                    vis.get_render_option().background_color = np.array([0.1, 0.1, 0.1])
+                    pcd = o3d.geometry.PointCloud()
+                    vis.add_geometry(pcd)
+                    runtime_state["vis"] = vis
+                except Exception as exc:
+                    logging.warning("Failed to create Open3D window (%s); disabling --show_pc.", exc)
+                    args.show_pc = 0
 
             frame_id = 0
             saved_count = 0
@@ -515,13 +643,9 @@ def main():
                 if args.use_color and not color_frame:
                     raise RuntimeError("Missing color frame while --use_color=1.")
 
-                left = np.asanyarray(left_frame.get_data())
-                right = np.asanyarray(right_frame.get_data())
-                color_bgr = (
-                    np.asanyarray(color_frame.get_data())
-                    if args.use_color and color_frame
-                    else None
-                )
+                left = frame_to_ndarray(left_frame)
+                right = frame_to_ndarray(right_frame)
+                color_bgr = frame_to_ndarray(color_frame) if args.use_color and color_frame else None
 
                 if args.rectify and rectify_maps is not None:
                     map_l1, map_l2, map_r1, map_r2 = rectify_maps

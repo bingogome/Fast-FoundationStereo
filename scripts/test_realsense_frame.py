@@ -10,6 +10,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+from PIL import Image
 
 
 def parse_args():
@@ -35,7 +36,12 @@ def parse_args():
     )
     parser.add_argument("--out_dir", type=str, default="output/realsense_test")
     parser.add_argument("--save_intrinsic_file", type=str, default=None)
-    parser.add_argument("--show", type=int, default=1)
+    parser.add_argument(
+        "--show",
+        type=int,
+        default=0,
+        help="Show OpenCV preview windows (0 for headless/SSH, 1 for local GUI).",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +63,53 @@ def save_runtime_k(path, K, baseline):
     with open(path, "w", encoding="utf-8") as f:
         f.write(" ".join(f"{x:.8f}" for x in K.reshape(-1)) + "\n")
         f.write(f"{baseline:.8f}\n")
+
+
+def frame_to_ndarray(frame):
+    """Convert a pyrealsense2 video frame into a concrete uint8 numpy array."""
+    if frame is None:
+        return None
+
+    # First try pyrealsense2's array interface.
+    arr = np.asarray(frame.get_data())
+    if isinstance(arr, np.ndarray) and arr.dtype != object and arr.size > 0:
+        return np.ascontiguousarray(arr)
+
+    # Fallback for platforms where array conversion returns an object-like view.
+    video = frame.as_video_frame()
+    h, w = video.get_height(), video.get_width()
+    bpp = video.get_bytes_per_pixel()
+    channels = max(1, int(bpp))
+
+    raw = np.frombuffer(frame.get_data(), dtype=np.uint8)
+    expected = h * w * channels
+    if raw.size < expected:
+        raise RuntimeError(
+            f"Frame buffer too small: got {raw.size} bytes, expected at least {expected}"
+        )
+    raw = raw[:expected]
+    if channels == 1:
+        return raw.reshape(h, w)
+    return raw.reshape(h, w, channels)
+
+
+def save_image(path, img, *, bgr=False):
+    """Save an image using Pillow to avoid OpenCV imwrite ABI/runtime issues."""
+    arr = np.ascontiguousarray(np.asarray(img))
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+
+    if arr.ndim == 2:
+        Image.fromarray(arr, mode="L").save(path)
+        return
+
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        if bgr:
+            arr = arr[:, :, ::-1]  # BGR -> RGB
+        Image.fromarray(arr, mode="RGB").save(path)
+        return
+
+    raise ValueError(f"Unsupported image shape for save: {arr.shape}")
 
 
 def stop_pipeline_safely(pipeline):
@@ -104,10 +157,15 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     reset_device_if_requested(rs, args)
 
+    if args.show and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("No display detected; forcing headless mode (--show 0).")
+        args.show = 0
+
     pipeline = None
     try:
         with ExitStack() as cleanup:
-            cleanup.callback(cv2.destroyAllWindows)
+            if args.show:
+                cleanup.callback(cv2.destroyAllWindows)
 
             pipeline = rs.pipeline()
             config = rs.config()
@@ -145,27 +203,23 @@ def main():
             if args.use_color and not color_frame:
                 raise RuntimeError("Failed to get color frame while --use_color=1.")
 
-            left = np.asanyarray(left_frame.get_data())
-            right = np.asanyarray(right_frame.get_data())
-            color = np.asanyarray(color_frame.get_data()) if color_frame else None
+            left = frame_to_ndarray(left_frame)
+            right = frame_to_ndarray(right_frame)
+            color = frame_to_ndarray(color_frame) if color_frame else None
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             left_path = os.path.join(args.out_dir, f"left_{ts}.png")
             right_path = os.path.join(args.out_dir, f"right_{ts}.png")
             pair_path = os.path.join(args.out_dir, f"pair_{ts}.png")
-            if not cv2.imwrite(left_path, left):
-                raise IOError(f"Failed to save image: {left_path}")
-            if not cv2.imwrite(right_path, right):
-                raise IOError(f"Failed to save image: {right_path}")
             pair = np.concatenate([left, right], axis=1)
-            if not cv2.imwrite(pair_path, pair):
-                raise IOError(f"Failed to save image: {pair_path}")
+            save_image(left_path, left)
+            save_image(right_path, right)
+            save_image(pair_path, pair)
 
             color_path = None
             if color is not None:
                 color_path = os.path.join(args.out_dir, f"color_{ts}.png")
-                if not cv2.imwrite(color_path, color):
-                    raise IOError(f"Failed to save image: {color_path}")
+                save_image(color_path, color, bgr=True)
 
             left_profile = left_frame.get_profile().as_video_stream_profile()
             right_profile = right_frame.get_profile().as_video_stream_profile()
